@@ -7,7 +7,7 @@ from typing import Optional
 app = FastAPI(
     title="API de Gestión de Finanzas",
     description="Software para lectura, consulta y administración de datos financieros desde Excel.",
-    version="1.0.0"
+    version="1.0.0",
 )
 
 # Variable global con el nombre del archivo de origen
@@ -20,43 +20,52 @@ segmentos_validos = set()
 productos_validos = set()
 
 
-def cargar_datos():
+def guardar_excel() -> None:
+    """Guarda el DataFrame actual en el archivo Excel manteniendo las columnas sin índice extra."""
+    df_para_guardar = df_finanzas.copy()
+    if "id" in df_para_guardar.columns:
+        df_para_guardar = df_para_guardar.drop(columns=["id"])
+    df_para_guardar.to_excel(ARCHIVO_EXCEL, index=False)
+
+
+def cargar_datos() -> None:
     """
-    Lee el archivo Excel al iniciar el servidor, limpia los nombres de columnas
-    y extrae los valores únicos iniciales de países, segmentos y productos.
+    Lee el archivo Excel al iniciar el servidor, normaliza nombres de columnas y fechas,
+    asigna un ID único y extrae los valores válidos iniciales de países, segmentos y productos.
     """
     global df_finanzas, paises_validos, segmentos_validos, productos_validos
     try:
-        # Leer el archivo Excel
         df = pd.read_excel(ARCHIVO_EXCEL)
 
         # Limpiar espacios en blanco extra en los nombres de las columnas
-        df.columns = df.columns.str.strip()
+        df.columns = df.columns.astype(str).str.strip()
 
         # Renombrar columnas para estandarizar nombres
         columnas_esperadas = {
+            "País": "Pais",
             "Unidades vendidas": "Unidades_vendidas",
             "Precio de manufactura": "Precio_manufactura",
             "Precio de venta": "Precio_venta",
             "Venta brutas": "Venta_brutas",
             "Costo de bienes vendidos": "Costo_bienes",
-            "Nombre Mes": "Nombre_Mes"
+            "Nombre Mes": "Nombre_Mes",
         }
         df.rename(columns=columnas_esperadas, inplace=True)
 
         # Asegurar que la columna Fecha se maneje como texto limpio (DD/MM/YYYY)
-        df["Fecha"] = pd.to_datetime(df["Fecha"]).dt.strftime("%d/%m/%Y")
+        if "Fecha" in df.columns:
+            df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
 
         # Asignar un ID único basado en el índice para facilitar búsquedas y eliminaciones
-        df.reset_index(inplace=True)
-        df.rename(columns={"index": "id"}, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        df.insert(0, "id", range(len(df)))
 
         df_finanzas = df
 
         # Poblar los conjuntos de valores válidos existentes
-        paises_validos = set(df_finanzas["Pais"].dropna().unique())
-        segmentos_validos = set(df_finanzas["Segmento"].dropna().unique())
-        productos_validos = set(df_finanzas["Producto"].dropna().unique())
+        paises_validos = set(df_finanzas["Pais"].dropna().astype(str).str.strip()) - {""}
+        segmentos_validos = set(df_finanzas["Segmento"].dropna().astype(str).str.strip()) - {""}
+        productos_validos = set(df_finanzas["Producto"].dropna().astype(str).str.strip()) - {""}
 
     except FileNotFoundError:
         raise RuntimeError(f"Error crítico: No se encontró el archivo '{ARCHIVO_EXCEL}'.")
@@ -80,7 +89,7 @@ class NuevaFinanza(BaseModel):
 
 
 class NuevoCatalogo(BaseModel):
-    tipo: str   # Debe ser: "Pais", "Segmento" o "Producto"
+    tipo: str  # Debe ser: "Pais", "Segmento" o "Producto"
     valor: str  # El nuevo nombre a registrar
 
 
@@ -91,7 +100,7 @@ class NuevoCatalogo(BaseModel):
 # 1) Mostrar todos los países
 @app.get("/paises", tags=["Consultas"])
 def mostrar_paises():
-    """Devuelve la lista completa de países registrados en el sistema."""
+    """Devuelve la lista completa y ordenada de países registrados en el sistema."""
     return {"paises": sorted(list(paises_validos))}
 
 
@@ -105,7 +114,8 @@ def paises_por_producto():
     resultado = {}
     agrupado = df_finanzas.groupby("Producto")["Pais"].unique()
     for producto, lista_paises in agrupado.items():
-        resultado[producto] = sorted(list(lista_paises))
+        paises_limpios = [str(p).strip() for p in lista_paises if pd.notna(p) and str(p).strip() != ""]
+        resultado[str(producto)] = sorted(list(set(paises_limpios)))
 
     return {"productos_por_pais": resultado}
 
@@ -115,29 +125,38 @@ def paises_por_producto():
 def calcular_beneficio_total(
     pais: Optional[str] = Query(None, description="Filtrar por nombre de País"),
     segmento: Optional[str] = Query(None, description="Filtrar por nombre de Segmento"),
-    producto: Optional[str] = Query(None, description="Filtrar por nombre de Producto")
+    producto: Optional[str] = Query(None, description="Filtrar por nombre de Producto"),
 ):
     """
     Calcula la suma total de la columna Beneficio.
     Permite filtrar opcionalmente por País, Segmento o Producto.
     """
+    if df_finanzas.empty:
+        raise HTTPException(status_code=404, detail="No hay datos financieros cargados.")
+
     df_filtrado = df_finanzas.copy()
 
     if pais:
-        df_filtrado = df_filtrado[df_filtrado["Pais"].str.lower() == pais.lower()]
+        df_filtrado = df_filtrado[
+            df_filtrado["Pais"].fillna("").astype(str).str.strip().str.lower() == pais.strip().lower()
+        ]
     if segmento:
-        df_filtrado = df_filtrado[df_filtrado["Segmento"].str.lower() == segmento.lower()]
+        df_filtrado = df_filtrado[
+            df_filtrado["Segmento"].fillna("").astype(str).str.strip().str.lower() == segmento.strip().lower()
+        ]
     if producto:
-        df_filtrado = df_filtrado[df_filtrado["Producto"].str.lower() == producto.lower()]
+        df_filtrado = df_filtrado[
+            df_filtrado["Producto"].fillna("").astype(str).str.strip().str.lower() == producto.strip().lower()
+        ]
 
     if df_filtrado.empty:
         raise HTTPException(status_code=404, detail="No se encontraron registros con los filtros proporcionados.")
 
-    beneficio_total = float(df_filtrado["Beneficio"].sum())
+    beneficio_total = float(pd.to_numeric(df_filtrado["Beneficio"], errors="coerce").fillna(0).sum())
     return {
         "filtros_aplicados": {"pais": pais, "segmento": segmento, "producto": producto},
         "registros_encontrados": len(df_filtrado),
-        "beneficio_total": round(beneficio_total, 2)
+        "beneficio_total": round(beneficio_total, 2),
     }
 
 
@@ -147,15 +166,19 @@ def finanzas_por_fecha(
     fecha: str = Query(..., description="Fecha a buscar en formato DD/MM/YYYY (ej. 01/01/2014)")
 ):
     """Filtra y devuelve todos los registros financieros correspondientes a una fecha exacta."""
-    df_filtrado = df_finanzas[df_finanzas["Fecha"] == fecha.strip()]
+    if df_finanzas.empty:
+        raise HTTPException(status_code=404, detail="No hay datos financieros cargados.")
+
+    fecha_limpia = fecha.strip()
+    df_filtrado = df_finanzas[df_finanzas["Fecha"].fillna("").astype(str).str.strip() == fecha_limpia]
 
     if df_filtrado.empty:
-        raise HTTPException(status_code=404, detail=f"No existen registros para la fecha {fecha}.")
+        raise HTTPException(status_code=404, detail=f"No existen registros para la fecha {fecha_limpia}.")
 
     return {
-        "fecha": fecha,
+        "fecha": fecha_limpia,
         "cantidad": len(df_filtrado),
-        "finanzas": df_filtrado.fillna("").to_dict(orient="records")
+        "finanzas": df_filtrado.fillna("").to_dict(orient="records"),
     }
 
 
@@ -166,12 +189,16 @@ def finanza_mayor_beneficio():
     if df_finanzas.empty:
         raise HTTPException(status_code=404, detail="No hay registros disponibles.")
 
-    indice_max = df_finanzas["Beneficio"].idxmax()
+    beneficios = pd.to_numeric(df_finanzas["Beneficio"], errors="coerce").dropna()
+    if beneficios.empty:
+        raise HTTPException(status_code=404, detail="No hay valores numéricos de Beneficio disponibles.")
+
+    indice_max = beneficios.idxmax()
     registro_max = df_finanzas.loc[indice_max].fillna("").to_dict()
 
     return {
         "mensaje": "Registro con mayor beneficio encontrado",
-        "datos": registro_max
+        "datos": registro_max,
     }
 
 
@@ -179,16 +206,27 @@ def finanza_mayor_beneficio():
 @app.get("/finanzas/mayor-ingreso-unidades", tags=["Consultas"])
 def finanza_mayor_ingreso_unidades():
     """
-    Calcula la relación entre Ventas y Unidades vendidas (ingreso unitario generado)
+    Calcula la relación entre Ventas y Unidades_vendidas (ingreso unitario generado)
     y devuelve el registro con el mayor valor.
     """
     if df_finanzas.empty:
         raise HTTPException(status_code=404, detail="No hay registros disponibles.")
 
-    col_unidades = [c for c in df_finanzas.columns if "Unidades" in c][0]
+    col_unidades = "Unidades_vendidas" if "Unidades_vendidas" in df_finanzas.columns else None
+    if not col_unidades:
+        candidatas = [c for c in df_finanzas.columns if "Unidades" in c]
+        if not candidatas:
+            raise HTTPException(status_code=400, detail="No se encontró la columna de unidades vendidas.")
+        col_unidades = candidatas[0]
 
     df_temp = df_finanzas.copy()
-    df_temp = df_temp[df_temp[col_unidades] > 0]
+    df_temp[col_unidades] = pd.to_numeric(df_temp[col_unidades], errors="coerce")
+    df_temp["Ventas"] = pd.to_numeric(df_temp["Ventas"], errors="coerce")
+    df_temp = df_temp[df_temp[col_unidades] > 0].dropna(subset=["Ventas", col_unidades])
+
+    if df_temp.empty:
+        raise HTTPException(status_code=404, detail="No hay registros válidos con unidades vendidas mayores a cero.")
+
     df_temp["ingreso_por_unidad"] = df_temp["Ventas"] / df_temp[col_unidades]
 
     indice_max = df_temp["ingreso_por_unidad"].idxmax()
@@ -197,7 +235,7 @@ def finanza_mayor_ingreso_unidades():
 
     return {
         "mensaje": "Registro con mayor ingreso por unidad vendida",
-        "datos": registro_max
+        "datos": registro_max,
     }
 
 
@@ -208,8 +246,11 @@ def top_5_paises_ventas():
     if df_finanzas.empty:
         raise HTTPException(status_code=404, detail="No hay datos disponibles.")
 
+    df_temp = df_finanzas.copy()
+    df_temp["Ventas"] = pd.to_numeric(df_temp["Ventas"], errors="coerce").fillna(0)
+
     top_paises = (
-        df_finanzas.groupby("Pais")["Ventas"]
+        df_temp.groupby("Pais")["Ventas"]
         .sum()
         .sort_values(ascending=False)
         .head(5)
@@ -232,31 +273,37 @@ def crear_finanza(datos: NuevaFinanza):
     """
     global df_finanzas
 
-    if datos.Pais not in paises_validos:
-        raise HTTPException(status_code=400, detail=f"El país '{datos.Pais}' no está registrado. Agrégalo primero.")
-    if datos.Segmento not in segmentos_validos:
-        raise HTTPException(status_code=400, detail=f"El segmento '{datos.Segmento}' no está registrado. Agrégalo primero.")
-    if datos.Producto not in productos_validos:
-        raise HTTPException(status_code=400, detail=f"El producto '{datos.Producto}' no está registrado. Agrégalo primero.")
+    pais_limpio = datos.Pais.strip()
+    segmento_limpio = datos.Segmento.strip()
+    producto_limpio = datos.Producto.strip()
+    fecha_limpia = datos.Fecha.strip()
 
-    nuevo_id = int(df_finanzas["id"].max() + 1) if not df_finanzas.empty else 0
+    if pais_limpio not in paises_validos:
+        raise HTTPException(status_code=400, detail=f"El país '{pais_limpio}' no está registrado. Agrégalo primero.")
+    if segmento_limpio not in segmentos_validos:
+        raise HTTPException(status_code=400, detail=f"El segmento '{segmento_limpio}' no está registrado. Agrégalo primero.")
+    if producto_limpio not in productos_validos:
+        raise HTTPException(status_code=400, detail=f"El producto '{producto_limpio}' no está registrado. Agrégalo primero.")
+
+    nuevo_id = int(df_finanzas["id"].max() + 1) if not df_finanzas.empty and "id" in df_finanzas.columns else 0
 
     nueva_fila = {
         "id": nuevo_id,
-        "Segmento": datos.Segmento,
-        "Pais": datos.Pais,
-        "Producto": datos.Producto,
+        "Segmento": segmento_limpio,
+        "Pais": pais_limpio,
+        "Producto": producto_limpio,
         "Unidades_vendidas": datos.Unidades_vendidas,
         "Ventas": datos.Ventas,
         "Beneficio": datos.Beneficio,
-        "Fecha": datos.Fecha
+        "Fecha": fecha_limpia,
     }
 
     df_finanzas = pd.concat([df_finanzas, pd.DataFrame([nueva_fila])], ignore_index=True)
+    guardar_excel()
 
     return {
         "mensaje": "Registro financiero creado exitosamente",
-        "finanza_creada": nueva_fila
+        "finanza_creada": nueva_fila,
     }
 
 
@@ -266,10 +313,11 @@ def eliminar_finanza(finanza_id: int):
     """Elimina un registro financiero existente buscando por su ID."""
     global df_finanzas
 
-    if finanza_id not in df_finanzas["id"].values:
+    if df_finanzas.empty or "id" not in df_finanzas.columns or finanza_id not in df_finanzas["id"].values:
         raise HTTPException(status_code=404, detail=f"No se encontró ninguna finanza con el ID {finanza_id}.")
 
-    df_finanzas = df_finanzas[df_finanzas["id"] != finanza_id]
+    df_finanzas = df_finanzas[df_finanzas["id"] != finanza_id].reset_index(drop=True)
+    guardar_excel()
 
     return {"mensaje": f"Registro financiero con ID {finanza_id} eliminado correctamente."}
 
@@ -284,23 +332,33 @@ def agregar_catalogo(item: NuevoCatalogo):
     if not valor_limpio:
         raise HTTPException(status_code=400, detail="El valor no puede estar vacío.")
 
-    if tipo_normalizado == "pais":
+    if tipo_normalizado in ("pais", "país"):
         if valor_limpio in paises_validos:
             raise HTTPException(status_code=400, detail="Ese país ya existe.")
         paises_validos.add(valor_limpio)
-        return {"mensaje": f"País '{valor_limpio}' agregado correctamente.", "paises_actuales": sorted(list(paises_validos))}
+        return {
+            "mensaje": f"País '{valor_limpio}' agregado correctamente.",
+            "paises_actuales": sorted(list(paises_validos)),
+        }
 
     elif tipo_normalizado == "segmento":
         if valor_limpio in segmentos_validos:
             raise HTTPException(status_code=400, detail="Ese segmento ya existe.")
         segmentos_validos.add(valor_limpio)
-        return {"mensaje": f"Segmento '{valor_limpio}' agregado correctamente.", "segmentos_actuales": sorted(list(segmentos_validos))}
+        return {
+            "mensaje": f"Segmento '{valor_limpio}' agregado correctamente.",
+            "segmentos_actuales": sorted(list(segmentos_validos)),
+        }
 
     elif tipo_normalizado == "producto":
         if valor_limpio in productos_validos:
             raise HTTPException(status_code=400, detail="Ese producto ya existe.")
         productos_validos.add(valor_limpio)
-        return {"mensaje": f"Producto '{valor_limpio}' agregado correctamente.", "productos_actuales": sorted(list(productos_validos))}
+        return {
+            "mensaje": f"Producto '{valor_limpio}' agregado correctamente.",
+            "productos_actuales": sorted(list(productos_validos)),
+        }
 
     else:
         raise HTTPException(status_code=400, detail="Tipo inválido. Debe ser 'Pais', 'Segmento' o 'Producto'.")
+        
